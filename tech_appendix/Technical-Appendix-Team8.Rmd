@@ -1,0 +1,1533 @@
+---
+title: "Technical Appendix"
+author: "Team 8"
+output: 
+  pdf_document:
+    number_sections: true
+fig_width: 6 
+fig_height: 4 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	root.dir = ".."
+)
+```
+
+\tableofcontents
+
+# Preface {-}
+
+The aim of this document is to provide the decisions, code and visualisations substantiating the appended report and its conclusions.
+
+# Packages {-}
+
+The below installs (if uncommented) and imports the libraries required for later analysis.
+
+```{r}
+# "Uncomment" the relevant lines below
+
+# install.packages("finalfit")
+# install.packages("knitr")
+# install.packages("rio")
+# install.packages("dplyr")
+# install.packages("readxl")
+# install.packages("stringr")
+# install.packages("ggplot2")
+# install.packages("gridExtra")
+# install.packages("zoo")
+# install.packages("ggcorrplot")
+# install.packages("lubridate")
+# install.packages("runner")
+# install.packages("flexsurv")
+# install.packages("survival")
+# install.packages("survminer")
+# install.packages("cmprsk")
+# install.packages("remotes")
+# remotes::install_github("nset-ornl/wbstats")
+# remotes::install_github("joachim-gassen/tidycovid19")
+# install.packages("ggrepel")
+# install.packages("grid")
+# install.packages("RColorBrewer")
+# install.packages("tidyverse")
+# install.packages("maps")
+
+library(finalfit)
+library(knitr)
+library(rio)
+library(dplyr)
+library(readxl)
+library(stringr)
+library(ggplot2)
+library(gridExtra)
+library(zoo)
+library(ggcorrplot)
+library(lubridate)
+library(runner)
+library(flexsurv)
+library(survival)
+library(survminer)
+library(cmprsk)
+library(remotes)
+library(tidycovid19)
+library(ggrepel)
+library(grid)
+library(RColorBrewer)
+library(tidyverse)
+```
+
+# Data {-}
+
+Data were joined offline from the original sources of OxCGRT and tidycovid19. The joined data was subset by countries in Europe, North America, and South America using the "continent" variable in OxCGRT. The cleaned data is imported below
+
+```{r}
+EAData <- read.csv("./data/processed/europe_americas.csv")
+```
+
+We then change the confirmed variable from cumulative cases to the daily cases, and removing missing values.
+
+```{r}
+EAData$DaysSinceJan1 <- as.numeric(as.Date(EAData$date) - as.Date("01-01-2020","%d-%m-%Y"))
+
+firstdiff <- function(x) {
+  shifted <- c(0,x[1:(length(x)-1)])
+  result = x-shifted
+  which_negative = which(result<0)
+  result[which_negative] = NA
+  return(result)
+}
+
+EAData <- EAData %>%
+  mutate(daily_confirmed = firstdiff(confirmed)) %>%
+filter(!is.na(continent)) %>%
+  filter(!is.na(C6_Stay.at.home.requirements)) %>%
+  filter(!is.na(H4_Emergency.investment.in.healthcare)) %>%
+  mutate(daily_confirmed = if_else(is.na(daily_confirmed), 0, daily_confirmed))
+```
+
+Here we are performing some simple data manipulation to get the data set into a style we can work with. We filter out any NA values and change the confirmed variable to the daily confirmed cases.
+
+Before starting any further analysis, in order to make our models more accurate we have mutated the retail, workplaces and grocery data to become a rolling mean of the previous 7 days. This is because data for the weekends was very different to the data on week days, leading to spikes every week.
+
+Also adding an estimate of current active cases once confirmed in with 14 days until removed and a lag of 2 days symptoms before test result.
+
+```{r}
+EAData$week <- week(EAData$date)
+EAData <- EAData %>% group_by(country) %>% mutate(m_retail = rollmean(gcmr_retail_recreation, k = 7, fill = NA), m_workplaces = rollmean(gcmr_workplaces, k=7, fill = NA), m_groc = rollmean(gcmr_grocery_pharmacy, k=7, fill = NA)) %>% ungroup()
+
+
+EAData <- EAData %>%
+  group_by(country) %>%
+  mutate(
+    date = ymd(date),
+    active = sum_run(
+      x = daily_confirmed,
+      k = 14,
+      lag = 2
+    )) %>%
+      mutate(
+        active_per_pop = active/population
+      ) %>%
+  ungroup()
+```
+
+```{r}
+euroData <- EAData %>% filter(continent == "Europe")
+
+northData <- EAData %>% filter(continent == "North America")
+
+southData <- EAData %>% filter(continent == "South America")
+```
+
+Next we create some simple visualisations to get a feel of the data.
+
+```{r acaps}
+read_csv("./data/processed/acaps_npi.csv", col_types = cols()) %>% 
+  mutate(npi_date = ymd(date_implemented)) %>% 
+  rename (npi_type = category) %>% 
+  select(iso3c, npi_date, npi_type) -> npi
+
+EAData %>% 
+  group_by(iso3c) %>%
+  filter(deaths >= 10) %>%
+  summarise(edate = min(date)) -> ctry_edate
+
+EAData %>%
+  select(iso3c, country) %>%
+  unique() -> ctry_names
+
+
+npi %>%
+  left_join(ctry_edate, by = "iso3c") %>%
+  filter(!is.na(edate)) %>%
+  mutate(npi_edate = as.numeric(npi_date - edate)) %>%
+  left_join(ctry_names, by = "iso3c") %>%
+  select(iso3c, country, npi_date, npi_edate, npi_type) -> npi_edates
+```
+
+# Exploratory Data Analysis
+
+## Broad Analysis
+
+### Interventions
+
+Aim to visualise the types of interventions, and when they came into place. The visualisations should be informative to compare countries.
+
+```{r Interventions, message=FALSE}
+lab_x <- "Days relative to the date \n where the number of deaths reached 10"
+
+
+ggplot(npi_edates, aes(x = npi_edate, fill = npi_type)) + 
+  geom_bar(position = "stack") + theme_minimal() +
+  labs(title = "Implementation of Interventions over Time",
+       x = lab_x,
+       y = "Number of interventions")
+
+npi_edates %>%
+  group_by(npi_edate, npi_type) %>%
+  summarise(
+    npi_count = n()
+  ) %>%
+  ungroup() %>%
+  arrange(npi_type, npi_edate) %>%
+  group_by(npi_type) %>%
+  mutate(npi_count =  cumsum(npi_count)) %>%
+  complete(npi_edate = min(npi_edates$npi_edate):max(npi_edates$npi_edate)) %>%
+  fill(npi_count) %>% 
+  replace_na(list(npi_count = 0)) %>%
+  ggplot(aes(x = npi_edate, fill = npi_type, y = npi_count)) +
+  theme_minimal() + labs(
+    x = lab_x,
+    y = "Percentage share of all interventions at event date",
+    title = "Interventions initialised relative to the first day 10 deaths is reached",
+    fill = "Intervention type", caption="Case data: JHU CSSE, Interventions data: ACAPS.\n Date obtained: November 19, 2020") + 
+  geom_area(position = "fill") + 
+  scale_y_continuous(labels = scales::percent)
+```
+
+Next classifying based on Covid "prevalence" per capita, where prevalence is defined as the number of cases per test conducted. Further social interaction measures are also defined and explained below.
+
+```{r ReImport}
+df <- read.csv("./data/processed/europe_americas.csv")
+
+ctries <- df %>%
+  group_by(iso3c) %>%
+  filter(!is.na(deaths), population >= 10e6) %>%
+  filter(date == max(date)) %>%
+  summarise(deaths_per_mio_pop = deaths * 1e6/population) %>%
+  filter(deaths_per_mio_pop > 100) %>% 
+  pull(iso3c)
+
+ave_measures <- df %>%
+  arrange(iso3c, date) %>%
+  group_by(iso3c) %>%
+  filter(iso3c %in% ctries) %>%
+  mutate(
+    new_cases = confirmed - lag(confirmed),
+    total_tests = na.approx(total_tests, na.rm = FALSE),
+    new_tests = total_tests - lag(total_tests),
+    ave_pos_test_rate = rollsum(
+      (confirmed - lag(confirmed))/new_tests,
+      7, na.pad=TRUE, align="right"
+    ),
+    ave_new_cases_wk_per_100e5 = rollsum(
+      new_cases*1e5/population, 7, na.pad=TRUE, align="right"
+    ),
+    ave_soc_dist_google = rollmean(
+      (gcmr_retail_recreation +  gcmr_transit_stations +
+        gcmr_workplaces)/3, 7, na.pad=TRUE, align="right"
+    ),
+    ave_soc_dist_apple = rollmean(
+      (apple_mtr_driving + apple_mtr_walking + apple_mtr_transit)/3, 
+      7, na.pad=TRUE, align="right"
+    )
+  ) %>%
+  filter(
+    max(
+      (date < lubridate::ymd("2020-04-01")) * ave_new_cases_wk_per_100e5,
+      na.rm = TRUE
+    ) > 10
+  ) %>%
+  select(
+    iso3c, country, date, population, ave_new_cases_wk_per_100e5, 
+    ave_pos_test_rate, ave_soc_dist_apple, ave_soc_dist_google, new_tests
+  ) 
+
+smp_countries <- unique(ave_measures$country)
+```
+
+
+
+```{r Subsetting}
+my_palette <- c(brewer.pal(8, "Set1"), "lightblue")
+
+ave_measures %>%
+  filter(date < lubridate::ymd("2020-06-01")) %>%
+  summarise(
+    cases = max(ave_pos_test_rate, na.rm = TRUE),
+    tests = mean(new_tests*1e5/population, na.rm = TRUE),
+    soc_dist = -min(ave_soc_dist_google, na.rm = TRUE)/100,
+    .groups = "drop"
+  ) %>% mutate(wave = "Spring") %>%
+  select(iso3c, wave, cases, soc_dist, tests) -> spring_wave
+
+ave_measures %>%
+  filter(date > lubridate::ymd("2020-09-01")) %>%
+  summarise(
+    cases = max(ave_pos_test_rate, na.rm = TRUE),
+    tests = mean(new_tests*1e5/population, na.rm = TRUE),
+    soc_dist = -min(ave_soc_dist_google, na.rm = TRUE)/100,
+    .groups = "drop"
+  ) %>% mutate(wave = "Autumn") %>%
+  select(iso3c, wave, cases, soc_dist, tests) -> fall_wave
+
+soc_dist_by_wave <- rbind(spring_wave, fall_wave)
+soc_dist_by_wave$wave <- factor(soc_dist_by_wave$wave, c("Spring", "Autumn"))
+```
+
+The analysis here is constricted to countries which have a population of more than 10 million that have had at least 100 Covid19 related deaths per million residents This ensures that the analysis is limited to reasonably large countries that have been significantly affected by Covid-19. Furthermore, to focus on countries that experienced both, the Spring and the Autumn waves, we constrict to the countries that had a peak daily new infections higher than 30 per 100,000 residents before April 2020.
+
+```{r TestSocial}
+ggplot(soc_dist_by_wave, aes(
+  x = cases, y = soc_dist, color = wave, label = iso3c)) +
+  geom_point() + 
+  geom_text_repel(color = "black") +
+  scale_x_continuous(trans = "log10") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  theme_minimal() +
+  scale_color_manual(values = my_palette) +
+  labs(
+    x = "Confirmed Cases per New Tests\n(log scale)",
+    y = "Reduction in Social Interaction\n(percentage to baseline)", 
+    title = "Comparing the decrease in social interaction in the Fall and Spring waves", 
+    subtitle = "There is a clear relative fall in the social interaction amongst all countries in the Autumn",
+    caption="Social interaction data: Google Community Mobility Reports data relative to the baseline period of \nJan 3 – Feb 6, 2020, Interventions data: ACAPS. Date obtained: November 19, 2020")
+```
+
+The plot above displays the reduction in social interaction with a baseline period set to be Jan 3 – Feb 6, 2020 against the log of confirmed cases per new tests. Social interaction represents the minimum rolling mean of average recreation, transit and workplaces Google mobility data across the countries relative to the baseline for the Spring and Autumn waves The x-axis here is the max rolling mean of confirmed cases per new tests for the 2 waves. Per new tests accounts for the increase in testing over the months.
+
+The graph shows a general fall in the social interactions in the Autumn waves relative to the Spring.
+
+```{r TestBar}
+fall_testing = fall_wave[-c(6,11), ]
+
+ggplot(fall_testing, aes(x=reorder(iso3c, -tests), y=tests, label = iso3c)) +
+  geom_bar(stat = "identity", fill = ifelse(fall_testing$tests>300, "#003F5C", "lightblue")) + coord_cartesian(ylim=c(100, 400))+ labs(x = "Countries", y = "Average Autumn Tests Conducted \n per 100,000 inhabitants", title = "Countries ordered with respect to Testing per 100,000 inhabitants", caption = "Case data: Johns Hopkins University Center for Systems Science and Engineering (JHU CSSE),\n Interventions data: ACAPS. Date obtained: November 19, 2020", subtitle = "Darker bars represent the number of tests conducted per 100,000 residents greater than 300.")+ theme_minimal()
+```
+
+The plot above displays the average daily new tests conducted per 100,000 inhabitants for countries from the 1st of September. The average daily new tests conducted per 100,000 inhabitants can be seen as metric of how many COVID-19 tests are available to the public for a population. In a business sense, this could be seen as employees having a greater easiness in getting a test and hence faster test results implying employees can act on that faster; be it self-isolation or getting back to work. Hence, recommend the business to consider focusing operations in these Great Britain, Belgium and the USA. Possible flaw here there will be more tests readily available because of the fact that country has more cases.
+
+```{r extras}
+library(tidycovid19)
+merged <- download_merged_data(cached = TRUE, silent = TRUE)
+plot_covid19_spread(merged, highlight = c("ITA", "ESP", "GBR", "FRA", 
+                                          "DEU", "USA", "BRA", "MEX"),
+intervention = "lockdown", edate_cutoff = 270)
+```
+
+```{r mapCap}
+map_covid19(merged, type = "confirmed", per_capita = TRUE)
+```
+
+### Retail Recreation
+
+```{r}
+ggplot(aes(x=date, y=m_retail), data = EAData) + geom_line(aes(group = country), 
+                                                           alpha = 0.1) + 
+  facet_wrap(~ continent) + geom_point(alpha = 0) + geom_smooth(method = "gam")
+```
+
+### Workplaces
+
+```{r}
+ggplot(aes(x=date, y=m_workplaces), data = EAData) + 
+  geom_line(aes(group = country), alpha = 0.1) + 
+  facet_wrap(~ continent) + geom_point(alpha = 0) + geom_smooth(method = "gam")
+```
+
+### Grocery Pharmacy
+
+```{r}
+ggplot(aes(x=date, y=m_groc), data = EAData) + geom_line(aes(group = country), 
+                                                         alpha = 0.1) + 
+  facet_wrap(~ continent) + geom_point(alpha = 0) + geom_smooth(method = "gam")
+```
+
+### UK / USA Plotting
+
+Now we are curious as to how the GCMR Retail & Recreation data changes over time depending on the stringency index in the oxford data set. So we plot two graphs for the UK and the US.
+
+```{r}
+EDADATA <- EAData %>%
+  filter(country == "United Kingdom" | country == "United States") %>%
+  select(date, confirmed, soc_dist, mov_rest, 
+         gcmr_retail_recreation, country, 
+         StringencyIndex, ContainmentHealthIndex, 
+         population) 
+
+ggplot(EDADATA, aes(x = date, y = gcmr_retail_recreation, 
+                    color = StringencyIndex)) +
+  geom_point() + 
+  facet_wrap(~ EDADATA$country)
+
+ggplot(aes(x= date, y= confirmed/population ), data = EDADATA) + 
+  geom_line() + facet_wrap(~ country)
+```
+
+We also plot the graphs of their daily cases. If cases decreased, it may imply more people would attend retail and recreational areas. However, it appears that the daily cases are continuing to rise so this unlikely to be case.
+
+Now we can see patterns in the data we want to explore the graphs between Countries with varying levels in the Stringency Index. So we take the mean stringency index for each country and plot the quartiles to see if there is any variation.
+
+```{r}
+max_ <- function(...) max(..., na.rm = T)
+mean_ <- function(...) mean(..., na.rm = T)
+
+MeanStringencyData <- EAData %>% group_by(country) %>% 
+  summarise(mean_stringency = mean(StringencyIndex), 
+            total_confirmed = max_(confirmed))
+
+EAData <- left_join(x = EAData, y = MeanStringencyData)
+
+quantile(EAData$mean_stringency, na.rm = TRUE)
+
+HStringency <- EAData %>% filter(mean_stringency > 64.41)
+
+MStringency <- EAData %>% filter(46.27 < mean_stringency, 
+                                 mean_stringency < 64.41)
+
+LStringency <- EAData %>% filter(mean_stringency < 46.27)
+```
+
+## Focused analysis
+
+### Retail and recreation
+
+#### Global stringency quartiles
+
+Upper:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_retail_recreation, color = StringencyIndex),
+       data = HStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = HStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+Middle:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_retail_recreation, color = StringencyIndex),
+       data = MStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = MStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+
+```
+
+Lower:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_retail_recreation, color = StringencyIndex),
+       data = LStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = LStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+
+```
+
+As we are looking to compare how the effects may differ between countries we next group countries by continent visualise trends.
+
+#### Regional groups
+
+```{r}
+ggplot(aes(x = date, y = gcmr_retail_recreation, color = StringencyIndex),
+       data = EAData) +
+  geom_point() + 
+  facet_wrap(~ region) + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = EAData) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1) + facet_wrap(~ region)
+```
+
+We now repeat our analysis for the other GCMR variables in the tidycovid19 dataset
+
+### Residential
+
+#### Global stringency quartiles
+
+Upper:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_residential, color = StringencyIndex ),
+       data = HStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = HStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+
+```
+
+Middle:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_residential, color = StringencyIndex ),
+       data = MStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = MStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+
+```
+
+Lower:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_residential, color = StringencyIndex ),
+       data = LStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = LStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+
+#### Regional groups
+
+```{r}
+ggplot(aes(x = date, y = gcmr_residential, color = StringencyIndex ),
+       data = EAData) +
+  geom_point() + facet_wrap(~ region) + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = EAData) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1) + facet_wrap(~ region)
+
+```
+
+### Grocery and pharmacy
+
+#### Global stringency quartiles
+
+Upper:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_grocery_pharmacy, color = StringencyIndex ),
+       data = HStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = HStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+Middle:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_grocery_pharmacy, color = StringencyIndex ),
+       data = MStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = MStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+Lower:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_grocery_pharmacy, color = StringencyIndex ),
+       data = LStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = LStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+#### Regional Groups
+
+```{r}
+ggplot(aes(x = date, y = gcmr_grocery_pharmacy, color = StringencyIndex ),
+       data = EAData) +
+  geom_point()+ facet_wrap(~ region) + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = EAData) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1) + facet_wrap(~ region)
+```
+
+
+### Workplaces
+
+#### Global stringency quartiles
+
+Upper:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_workplaces, color = StringencyIndex ),
+       data = HStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = HStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+Middle:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_workplaces, color = StringencyIndex ),
+       data = MStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = MStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+Lower:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_workplaces, color = StringencyIndex ),
+       data = LStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = LStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+
+#### Regional groups
+
+```{r}
+ggplot(aes(x = date, y = gcmr_workplaces, color = StringencyIndex ),
+       data = EAData) +
+    geom_point()+ facet_wrap(~ region) + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = EAData) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1) + facet_wrap(~ region)
+```
+
+
+### Transit stations
+
+#### Global stringency quartiles
+
+Upper:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_transit_stations, color = StringencyIndex ),
+       data = HStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = HStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+Middle: 
+
+```{r}
+ggplot(aes(x = date, y = gcmr_transit_stations, color = StringencyIndex ),
+       data = MStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = MStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+Lower:
+
+```{r}
+ggplot(aes(x = date, y = gcmr_transit_stations, color = StringencyIndex ),
+       data = LStringency) +
+    geom_point() + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = LStringency) + geom_point() + 
+  geom_smooth(colour = "red", method = "gam", group = 1)
+```
+
+
+#### Regional groups
+
+```{r}
+ggplot(aes(x = date, y = gcmr_transit_stations, color = StringencyIndex ),data = EAData) +
+    geom_point()+ facet_wrap(~ region)  + geom_smooth(colour = "red", method = "gam", group = 1)
+
+ggplot(aes(x= date, y= confirmed), data = EAData) + geom_point() + geom_smooth(colour = "red", method = "gam", group = 1) + facet_wrap(~ region)
+```
+
+# Correlation analysis & testing
+
+## Correlation of GCMR variables
+
+Pearson correlation between the variables in Google Community Mobility Reports is visualised below.
+
+```{r}
+gcmr_only <- EAData %>% select(gcmr_retail_recreation, gcmr_grocery_pharmacy,
+                               gcmr_parks, gcmr_transit_stations,
+                               gcmr_workplaces, gcmr_residential)
+names(gcmr_only) <- c("Retail & recreation", "Grocery & pharmacy", "Parks",
+                      "Transit stations", "Workplaces", "Residential")
+gcmr_cor <- cor(gcmr_only, use = "pairwise.complete.obs", method = "pearson")
+ggcorrplot(gcmr_cor, hc.order = TRUE) + 
+  ggtitle("Correlation heatmap of GCMR variables")
+```
+
+Notably, residential activity is significantly negatively correlated with all other variables. This is unsurprising, as it can be safely assumed that when a person is their residence, they are not in one of the other places denoted by the variable, and vice versa. There is a strong correlation between transit station activity and retail and recreation activity. This perhaps can be attributed to people using transit stations to commute to their retail and recreation activities.
+
+## Correlation of Oxford containment indices
+
+The below heatmap visualises the Pearson correlation between containment variables provided by the OxCGRT data.
+
+```{r}
+containment_only <- EAData %>% select(C1_School.closing, C2_Workplace.closing,
+                                      C3_Cancel.public.events, 
+                                      C4_Restrictions.on.gatherings,
+                                      C5_Close.public.transport,
+                                      C6_Stay.at.home.requirements,
+                                      C7_Restrictions.on.internal.movement,
+                                      C8_International.travel.controls)
+names(containment_only) <- c("Closed schools", "Closed workplaces", 
+                             "Cancelled public events",
+                             "Gathering restrictions",
+                             "Closed public transport",
+                             "Stay at home requirements",
+                             "Internal movement restrictions",
+                             "International travel controls")
+containment_cor <- cor(containment_only, use = "pairwise.complete.obs", method = "pearson")
+ggcorrplot(containment_cor, hc.order = TRUE) + 
+  ggtitle("Correlation heatmap of OxCGRT \nContainment indices") + 
+  scale_fill_gradient2(limit = c(0.4,1), low = "blue", high =  "red", mid = "white", midpoint = 0.7)
+```
+
+It should be noted that the scale has changed, in order to better visualise the correlation. All indices are positively correlated. The least positively correlated indices are between international travel controls, and closed public transport. Worldwide, international travel restrictions were very strict, and remained in place for months; however, public transport was not fully closed in many countries, as it was a necessary part of transit for essential health workers.
+
+Cancelling big events and gathering restrictions are very closely correlated, as they often represent the same type of government intervention - preventing large numbers of people from congregating.
+
+## Correlation of Oxford health indices
+
+The below heatmap visualises the Pearson correlation between health variables provided by the OxCGRT data.
+
+```{r}
+health_only <- EAData %>% select(H1_Public.information.campaigns,
+                                 H2_Testing.policy,
+                                 H3_Contact.tracing,
+                                 H4_Emergency.investment.in.healthcare,
+                                 H5_Investment.in.vaccines,
+                                 H6_Facial.Coverings)
+names(health_only) <- c("Public information", "Testing policy", 
+                             "Contact tracing",
+                             "Healthcare investment",
+                             "Vaccine investment",
+                             "Facial coverings")
+health_cor <- cor(health_only, use = "pairwise.complete.obs", method = "pearson")
+ggcorrplot(health_cor, hc.order = TRUE) + 
+  ggtitle("Correlation heatmap of OxCGRT \nHealth indices") + 
+  scale_fill_gradient2(limit = c(-0.1,1), low = "blue", high =  "red", mid = "white", midpoint = 0.45)
+```
+
+As with the containment indices, the scale has been adjusted to represent the true distribution of correlations.
+There are no notable correlations with these health indices. Facial coverings, public information campaigns, testing policies, and contact tracing are weakly positively correlated. These variables represent basic healthcare management steps in the face of a pandemic, and are likely to coexist.
+
+## Combined correlation
+
+After having plotted some graphs to get a feel for how the data looks and behaves we want to know if any variables are correlated so perhaps we can explore them in more detail. Here we explore if there is any correlation between the individual, C - containment and closure policies and H - health system policies with the Retail, Workplace and Groceries variables. 
+
+```{r}
+correlation_df <- data.frame(
+  row.names = c("C1","C2","C3","C4","C5",
+                "C6","C7","C8","H1","H2",
+                "H3","H4","H5","H6"), 
+  Retail_Corr = c(C1 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$C1_School.closing, 
+                           use = "complete.obs"),
+                  C2 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$C2_Workplace.closing, 
+                           use = "complete.obs"),
+                  C3 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$C3_Cancel.public.events, 
+                           use = "complete.obs"),
+                  C4 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$C4_Restrictions.on.gatherings, 
+                           use = "complete.obs"),
+                  C5 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$C5_Close.public.transport, 
+                           use = "complete.obs"),
+                  C6 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$C6_Stay.at.home.requirements,
+                           use = "complete.obs"),
+                  C7 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$C7_Restrictions.on.internal.movement, 
+                           use = "complete.obs"),
+                  C8 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$C8_International.travel.controls, 
+                           use = "complete.obs"),
+                  H1 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$H1_Public.information.campaigns, 
+                           use = "complete.obs"),
+                  H2 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$H2_Testing.policy, 
+                           use = "complete.obs"),
+                  H3 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$H3_Contact.tracing,
+                           use = "complete.obs"),
+                  H4 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$H4_Emergency.investment.in.healthcare, 
+                           use = "complete.obs"),
+                  H5 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$H5_Investment.in.vaccines, 
+                           use = "complete.obs"),
+                  H6 = cor(EAData$gcmr_retail_recreation, 
+                           EAData$H6_Facial.Coverings, 
+                           use = "complete.obs")
+  ),
+  Workplace_Corr = c(C1 = cor(EAData$gcmr_workplaces, 
+                           EAData$C1_School.closing, 
+                           use = "complete.obs"),
+                  C2 = cor(EAData$gcmr_workplaces, 
+                           EAData$C2_Workplace.closing, 
+                           use = "complete.obs"),
+                  C3 = cor(EAData$gcmr_workplaces, 
+                           EAData$C3_Cancel.public.events, 
+                           use = "complete.obs"),
+                  C4 = cor(EAData$gcmr_workplaces, 
+                           EAData$C4_Restrictions.on.gatherings, 
+                           use = "complete.obs"),
+                  C5 = cor(EAData$gcmr_workplaces, 
+                           EAData$C5_Close.public.transport, 
+                           use = "complete.obs"),
+                  C6 = cor(EAData$gcmr_workplaces, 
+                           EAData$C6_Stay.at.home.requirements,
+                           use = "complete.obs"),
+                  C7 = cor(EAData$gcmr_workplaces, 
+                           EAData$C7_Restrictions.on.internal.movement, 
+                           use = "complete.obs"),
+                  C8 = cor(EAData$gcmr_workplaces, 
+                           EAData$C8_International.travel.controls, 
+                           use = "complete.obs"),
+                  H1 = cor(EAData$gcmr_workplaces, 
+                           EAData$H1_Public.information.campaigns, 
+                           use = "complete.obs"),
+                  H2 = cor(EAData$gcmr_workplaces, 
+                           EAData$H2_Testing.policy, 
+                           use = "complete.obs"),
+                  H3 = cor(EAData$gcmr_workplaces, 
+                           EAData$H3_Contact.tracing,
+                           use = "complete.obs"),
+                  H4 = cor(EAData$gcmr_workplaces, 
+                           EAData$H4_Emergency.investment.in.healthcare, 
+                           use = "complete.obs"),
+                  H5 = cor(EAData$gcmr_workplaces, 
+                           EAData$H5_Investment.in.vaccines, 
+                           use = "complete.obs"),
+                  H6 = cor(EAData$gcmr_workplaces, 
+                           EAData$H6_Facial.Coverings, 
+                           use = "complete.obs")
+  ),
+  Grocery_Corr = c(C1 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$C1_School.closing, 
+                           use = "complete.obs"),
+                  C2 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$C2_Workplace.closing, 
+                           use = "complete.obs"),
+                  C3 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$C3_Cancel.public.events, 
+                           use = "complete.obs"),
+                  C4 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$C4_Restrictions.on.gatherings, 
+                           use = "complete.obs"),
+                  C5 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$C5_Close.public.transport, 
+                           use = "complete.obs"),
+                  C6 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$C6_Stay.at.home.requirements,
+                           use = "complete.obs"),
+                  C7 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$C7_Restrictions.on.internal.movement, 
+                           use = "complete.obs"),
+                  C8 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$C8_International.travel.controls, 
+                           use = "complete.obs"),
+                  H1 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$H1_Public.information.campaigns, 
+                           use = "complete.obs"),
+                  H2 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$H2_Testing.policy, 
+                           use = "complete.obs"),
+                  H3 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$H3_Contact.tracing,
+                           use = "complete.obs"),
+                  H4 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$H4_Emergency.investment.in.healthcare, 
+                           use = "complete.obs"),
+                  H5 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$H5_Investment.in.vaccines, 
+                           use = "complete.obs"),
+                  H6 = cor(EAData$gcmr_grocery_pharmacy, 
+                           EAData$H6_Facial.Coverings, 
+                           use = "complete.obs")
+  ))
+
+kable(correlation_df)
+```
+
+## Shapiro normality testing
+
+For modelling purposes we thought it may be a good idea to test if either GCMR Retail & Recreation or Workplaces were normally distributed. So we tested them with the Shapiro-Wilk normality test. However as the data set was to big it had to be split by continents, and as the Europe set was still to large it was evaluated visually by QQ-plots.
+
+```{r}
+
+Test.A <- EAData %>% filter(region == "North America")
+
+shapiro.test(Test.A$gcmr_retail_recreation)
+shapiro.test(Test.A$gcmr_workplaces)
+
+Test.B <- EAData %>% filter(continent == "South America")
+
+shapiro.test(Test.B$gcmr_retail_recreation)
+shapiro.test(Test.B$gcmr_workplaces)
+
+Test.C <- EAData %>% filter(continent == "Europe")
+
+qqnorm(Test.C$gcmr_retail_recreation)
+qqline(Test.C$gcmr_retail_recreation)
+
+qqnorm(Test.C$gcmr_workplaces)
+qqline(Test.C$gcmr_workplaces)
+
+```
+
+The tests show that the relationship between changes in retail & recreation / grocery and pharmacy and new confirmed
+cases of COVID-19 in all regions were significantly different from the normal distribution.
+
+# Modelling
+
+## Retail
+
+In this section we will be creating various models of the retail variable.  
+We split these models by continent as we've seen there are different patterns for each continent.
+
+### Europe simple
+
+Starting with Europe we create a simplified minimum and maximum linear model and use backwards stepwise regression to find the most appropriate model for retail
+
+```{r}
+min_modelE1 <- lm(m_retail ~ 1, data = euroData)
+max_modelE1 <- lm(m_retail ~ 1 +
+C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls + (active_per_pop), data = euroData)
+
+euro_rr_backward1 <- step(max_modelE1, direction = 'backward',
+scope = list('lower' = min_modelE1))
+```
+
+And here is our most appropriate model
+
+```{r}
+summary(euro_rr_backward1)
+```
+
+in which we can see that all explanatory variables have been kept.  
+
+### Europe complex
+
+We now create a more complex model which involves more explanatory variables and their interactions.
+
+```{r echo = T, results = 'hide'}
+min_modelE2 <- lm(m_retail ~ 1, data = euroData)
+max_modelE2 <- lm(data = euroData, m_retail ~ 1 + (active_per_pop) + 
+(C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls)*(H1_Public.information.campaigns + H2_Testing.policy + H3_Contact.tracing + H4_Emergency.investment.in.healthcare) + gdp_capita + pop_density)
+
+euro_rr_backward2 <- step(max_modelE2, direction = 'backward',
+scope = list('lower' = min_modelE2))
+```
+
+After stepwise regression analysis we our result of the most appropriate model is as follows
+
+```{r}
+summary(euro_rr_backward2)
+```
+
+Using our models we now try to create predictions as to outcome of the retail variable
+
+```{r}
+Europe_daily_means2 <- euroData %>%
+  group_by(date) %>%
+  summarise_all(mean)
+
+Europe_daily_means2$country <- "AVERAGE"
+
+Europe_daily_means2$predicted_retail_recreation1 <- unname(predict(euro_rr_backward1, newdata = Europe_daily_means2))
+Europe_daily_means2$predicted_retail_recreation2 <- unname(predict(euro_rr_backward2, newdata = Europe_daily_means2))
+```
+
+To visualise our predictive models we overlay them on the plot of the mean retail vs date
+
+```{r}
+ggplot() + geom_line(aes(y=m_retail, x=date, group = country), data = euroData, alpha = 0.2) + geom_smooth(aes(y=predicted_retail_recreation1, x=date), data = Europe_daily_means2, colour = "red", span = 0.1) + geom_smooth(aes(y=predicted_retail_recreation2, x=date), data = Europe_daily_means2, colour = "blue", span = 0.1)
+```
+
+We now repeat the same process for North America and South American.
+
+### North America simple
+
+```{r}
+min_modelN1 <- lm(m_retail ~ 1, data = northData)
+max_modelN1 <- lm(m_retail ~ 1 +
+C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls + (active_per_pop), data = northData)
+
+north_rr_backward1 <- step(max_modelN1, direction = 'backward',
+scope = list('lower' = min_modelN1))
+```
+
+```{r}
+summary(north_rr_backward1)
+```
+
+### North America Complex
+
+```{r echo = T, results = 'hide'}
+min_modelN2 <- lm(m_retail ~ 1, data = northData)
+max_modelN2 <- lm(data = northData, m_retail ~ 1 + active_per_pop + 
+(C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls)*(H1_Public.information.campaigns + H2_Testing.policy + H3_Contact.tracing + H4_Emergency.investment.in.healthcare) + gdp_capita + pop_density)
+
+north_rr_backward2 <- step(max_modelN2, direction = 'backward',
+scope = list('lower' = min_modelN2))
+```
+
+```{r}
+north_daily_means2 <- northData %>%
+  group_by(date) %>%
+  summarise_all(mean)
+
+north_daily_means2$country <- "AVERAGE"
+
+north_daily_means2$predicted_retail_recreation1 <- unname(predict(north_rr_backward1, newdata = north_daily_means2))
+north_daily_means2$predicted_retail_recreation2 <- unname(predict(north_rr_backward2, newdata = north_daily_means2))
+```
+
+```{r}
+ggplot() + geom_line(aes(y=m_retail, x=date, group = country), data = northData, alpha = 0.2) + geom_smooth(aes(y=predicted_retail_recreation1, x=date), data = north_daily_means2, colour = "red", span = 0.1) + geom_smooth(aes(y=predicted_retail_recreation2, x=date), data = north_daily_means2, colour = "blue", span = 0.1)
+```
+
+### South America simple
+
+```{r}
+min_modelS1 <- lm(m_retail ~ 1, data = southData)
+max_modelS1 <- lm(m_retail ~ 1 +
+C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls + active_per_pop, data = southData)
+
+south_rr_backward1 <- step(max_modelS1, direction = 'backward',
+scope = list('lower' = min_modelS1))
+```
+
+```{r}
+summary(south_rr_backward1)
+```
+
+### South America complex
+
+```{r echo = T, results = 'hide'}
+min_modelS2 <- lm(m_retail ~ 1, data = southData)
+max_modelS2 <- lm(data = southData, m_retail ~ 1 + active_per_pop + 
+(C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls)*(H1_Public.information.campaigns + H2_Testing.policy + H3_Contact.tracing + H4_Emergency.investment.in.healthcare) + gdp_capita + pop_density)
+
+south_rr_backward2 <- step(max_modelS2, direction = 'backward',
+scope = list('lower' = min_modelS2))
+```
+
+```{r}
+south_daily_means2 <- southData %>%
+  group_by(date) %>%
+  summarise_all(mean)
+
+south_daily_means2$country <- "AVERAGE"
+
+south_daily_means2$predicted_retail_recreation1 <- unname(predict(south_rr_backward1, newdata = south_daily_means2))
+south_daily_means2$predicted_retail_recreation2 <- unname(predict(south_rr_backward2, newdata = south_daily_means2))
+```
+
+```{r}
+ggplot() + geom_line(aes(y=m_retail, x=date, group = country), data = southData, alpha = 0.2) + geom_smooth(aes(y=predicted_retail_recreation1, x=date), data = south_daily_means2, colour = "red", span = 0.1) + geom_smooth(aes(y=predicted_retail_recreation2, x=date), data = south_daily_means2, colour = "blue", span = 0.1)
+```
+
+### Model evaluation
+
+In order to evaluate the fit of each model we use the adjusted $R^2$ to see how well each of them fit 
+
+```{r}
+PRESS <- function(linear.model) {
+    pr <- residuals(linear.model)/(1 - lm.influence(linear.model)$hat)
+    PRESS <- sum(pr^2)
+    return(PRESS)
+}
+pred_r_squared <- function(linear.model) {
+    lm.anova <- anova(linear.model)
+    tss <- sum(lm.anova$"Sum Sq")
+    # predictive R^2
+    pred.r.squared <- 1 - PRESS(linear.model)/(tss)
+    return(pred.r.squared)
+}
+```
+
+```{r}
+eval_df <- data.frame(model = c("Simple Euro", "Complex Euro", "Simple North America", "Complex North America", "Simple South America", "Complex South America"), 
+                      predictedRsq = c(pred_r_squared(euro_rr_backward1), pred_r_squared(euro_rr_backward2), pred_r_squared(north_rr_backward1), pred_r_squared(north_rr_backward2), pred_r_squared(south_rr_backward1), pred_r_squared(south_rr_backward2)), 
+                      adjustedRsq = c(summary(euro_rr_backward1)$adj.r.squared, summary(euro_rr_backward2)$adj.r.squared, summary(north_rr_backward1)$adj.r.squared, summary(north_rr_backward2)$adj.r.squared, summary(south_rr_backward1)$adj.r.squared, summary(south_rr_backward2)$adj.r.squared))
+
+kable(eval_df)
+```
+
+### Comparing simple models
+
+We want to see how much these models differ and so we create a table with the coefficients of each explanatory variable. Here we can now see where the major similarities and differences are between each regions linear model.
+
+```{r}
+summary_df <- data.frame(Europe = euro_rr_backward1$coefficients,
+                         Europe_p_values = format(summary(euro_rr_backward1)$coefficients[,4], scientific = T, digits = 2),
+                         
+                         North_America = c(north_rr_backward1$coefficients[1:3], "Excluded", north_rr_backward1$coefficients[4:9]),
+                         North_p_values = c(format(summary(north_rr_backward1)$coefficients[1:3,4], scientific = T, digits = 2), "NA", format(summary(north_rr_backward1)$coefficients[4:9,4], scientific = T, digits = 2)),
+                         
+                         South_America = south_rr_backward1$coefficients,
+                         South_p_values = format(summary(south_rr_backward1)$coefficients[,4], scientific = T, digits = 2))
+
+row.names(summary_df) = c("Intercept", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "Active per pop")
+kable(summary_df)
+```
+
+
+### Grocery and pharmacy vs retail and recreation
+
+Exploring the data further we find that there seems to be some correlation between Retail and Grocery
+
+```{r}
+ggplot(aes(x=m_retail, y=m_groc), data = euroData) + geom_point(alpha = 0.1)
+```
+
+So we plot Mean retail vs Mean grocery for each continent.
+
+```{r}
+ggplot(aes(x=m_retail, y=m_groc), data = EAData) + geom_point(alpha = 0.1) + facet_wrap(~ continent) + geom_smooth(method = "lm")
+```
+
+We can see this is confirmed with a simple test.
+```{r}
+cor(y = euroData$m_retail, x = euroData$m_groc, method = "pearson", use = "complete.obs")
+```
+
+### Workplace by predicted retail
+
+So using the predictions from our complex linear models for Retail we create another linear model for each continent where mean of workplaces is the observed variable.
+
+```{r}
+euroData$predicted_retail_recreation2 <- unname(predict(euro_rr_backward2, newdata = euroData))
+northData$predicted_retail_recreation2 <- unname(predict(north_rr_backward2, newdata = northData))
+southData$predicted_retail_recreation2 <- unname(predict(south_rr_backward2, newdata = southData))
+
+euro_retail_workplaces_lm <- lm(m_groc ~ predicted_retail_recreation2, data = euroData)
+summary(euro_retail_workplaces_lm)
+
+north_retail_workplaces_lm <- lm(m_groc ~ predicted_retail_recreation2, data = northData)
+summary(north_retail_workplaces_lm)
+
+south_retail_workplaces_lm <- lm(m_groc ~ predicted_retail_recreation2, data = southData)
+summary(south_retail_workplaces_lm)
+```
+
+## Workplaces
+
+Here we follow the same modeling and analysis process as for Retail but instead for Workplaces
+
+### Europe simple
+
+```{r}
+Wmin_modelE1 <- lm(m_workplaces ~ 1, data = euroData)
+Wmax_modelE1 <- lm(m_workplaces ~ 1 +
+C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls + (active_per_pop), data = euroData)
+
+euro_w_backward1 <- step(Wmax_modelE1, direction = 'backward',
+scope = list('lower' = Wmin_modelE1))
+```
+
+```{r}
+summary(euro_w_backward1)
+```
+
+#### Europe complex
+
+```{r echo = T, results = 'hide'}
+Wmin_modelE2 <- lm(m_workplaces ~ 1, data = euroData)
+Wmax_modelE2 <- lm(data = euroData, m_workplaces ~ 1 + (active_per_pop) + 
+(C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls)*(H1_Public.information.campaigns + H2_Testing.policy + H3_Contact.tracing + H4_Emergency.investment.in.healthcare) + gdp_capita + pop_density)
+
+euro_w_backward2 <- step(Wmax_modelE2, direction = 'backward',
+scope = list('lower' = Wmin_modelE2))
+```
+
+```{r}
+Europe_daily_means2 <- euroData %>%
+  group_by(date) %>%
+  summarise_all(mean)
+
+Europe_daily_means2$country <- "AVERAGE"
+
+Europe_daily_means2$predicted_wp1 <- unname(predict(euro_w_backward1, newdata = Europe_daily_means2))
+Europe_daily_means2$predicted_wp2 <- unname(predict(euro_w_backward2, newdata = Europe_daily_means2))
+```
+
+```{r}
+ggplot() + geom_line(aes(y=m_workplaces, x=date, group = country), data = euroData, alpha = 0.2) + geom_smooth(aes(y=predicted_wp1, x=date), data = Europe_daily_means2, colour = "red", span = 0.1) + geom_smooth(aes(y=predicted_wp2, x=date), data = Europe_daily_means2, colour = "blue", span = 0.1)
+```
+
+### North America simple
+
+```{r}
+Wmin_modelN1 <- lm(m_workplaces ~ 1, data = northData)
+Wmax_modelN1 <- lm(m_workplaces ~ 1 +
+C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls + active_per_pop, data = northData)
+
+north_w_backward1 <- step(Wmax_modelN1, direction = 'backward',
+scope = list('lower' = Wmin_modelN1))
+```
+
+```{r}
+summary(north_w_backward1)
+```
+
+### North America complex
+
+```{r echo = T, results = 'hide'}
+Wmin_modelN2 <- lm(m_workplaces ~ 1, data = northData)
+Wmax_modelN2 <- lm(data = northData, m_workplaces ~ 1 + active_per_pop + 
+(C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls)*(H1_Public.information.campaigns + H2_Testing.policy + H3_Contact.tracing + H4_Emergency.investment.in.healthcare) + gdp_capita + pop_density)
+
+north_w_backward2 <- step(Wmax_modelN2, direction = 'backward',
+scope = list('lower' = Wmin_modelN2))
+```
+
+```{r}
+north_daily_means2 <- northData %>%
+  group_by(date) %>%
+  summarise_all(mean)
+
+north_daily_means2$country <- "AVERAGE"
+
+north_daily_means2$predicted_wp1 <- unname(predict(north_w_backward1, newdata = north_daily_means2))
+north_daily_means2$predicted_wp2 <- unname(predict(north_w_backward2, newdata = north_daily_means2))
+```
+
+```{r}
+ggplot() + geom_line(aes(y=m_workplaces, x=date, group = country), data = northData, alpha = 0.2) + geom_smooth(aes(y=predicted_wp1, x=date), data = north_daily_means2, colour = "red", span = 0.1) + geom_smooth(aes(y=predicted_wp2, x=date), data = north_daily_means2, colour = "blue", span = 0.1)
+```
+
+### South America simple
+
+```{r}
+Wmin_modelS1 <- lm(m_workplaces ~ 1, data = southData)
+Wmax_modelS1 <- lm(m_workplaces ~ 1 +
+C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls + active_per_pop, data = southData)
+
+south_w_backward1 <- step(Wmax_modelS1, direction = 'backward',
+scope = list('lower' = Wmin_modelS1))
+```
+
+```{r}
+summary(south_w_backward1)
+```
+
+### South America Complex
+
+```{r echo = T, results = 'hide'}
+Wmin_modelS2 <- lm(m_workplaces ~ 1, data = southData)
+Wmax_modelS2 <- lm(data = southData, m_workplaces ~ 1 + active_per_pop + 
+(C1_School.closing + C2_Workplace.closing + C3_Cancel.public.events + C4_Restrictions.on.gatherings +
+C5_Close.public.transport + C6_Stay.at.home.requirements + C7_Restrictions.on.internal.movement +
+C8_International.travel.controls)*(H1_Public.information.campaigns + H2_Testing.policy + H3_Contact.tracing + H4_Emergency.investment.in.healthcare) + gdp_capita + pop_density)
+
+south_w_backward2 <- step(Wmax_modelS2, direction = 'backward',
+scope = list('lower' = Wmin_modelS2))
+```
+
+```{r}
+south_daily_means2 <- southData %>%
+  group_by(date) %>%
+  summarise_all(mean)
+
+south_daily_means2$country <- "AVERAGE"
+
+south_daily_means2$predicted_wp1 <- unname(predict(south_w_backward1, newdata = south_daily_means2))
+south_daily_means2$predicted_wp2 <- unname(predict(south_w_backward2, newdata = south_daily_means2))
+```
+
+```{r}
+ggplot() + geom_line(aes(y=m_workplaces, x=date, group = country), data = southData, alpha = 0.2) + geom_smooth(aes(y=predicted_wp1, x=date), data = south_daily_means2, colour = "red", span = 0.1) + geom_smooth(aes(y=predicted_wp2, x=date), data = south_daily_means2, colour = "blue", span = 0.1)
+```
+
+### Comparing simple models
+
+```{r}
+summary_df1 <- data.frame(Europe = c(euro_w_backward1$coefficients),
+                         Europe_p_values = c(format(summary(euro_w_backward1)$coefficients[,4], 
+                                                  scientific = T, digits = 2)),
+                         
+                         North_America = c(north_w_backward1$coefficients[1:7], 
+                                           "Excluded", 
+                                           north_w_backward1$coefficients[8:9]),
+                         North_p_values = c(format(summary(north_w_backward1)$coefficients[1:7,4], scientific = T, digits = 2), "NA", format(summary(north_w_backward1)$coefficients[8:9,4], scientific = T, digits = 2)),
+                         
+                         South_America = south_w_backward1$coefficients,
+                         South_p_values = format(summary(south_w_backward1)$coefficients[,4], scientific = T, digits = 2))
+row.names(summary_df1) = c("Intercept", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "Active per pop")
+kable(summary_df1)
+```
+
+We look to see if there is any correlation between Retail and Workplaces, as there was for Retail and Grocery
+
+```{r}
+cor(y = euroData$m_retail, x = euroData$m_workplaces, method = "pearson", use = "complete.obs")
+```
+
+
+## Transit
+
+### Europe
+
+```{r}
+ggplot(data = euroData, aes(x = GovernmentResponseIndex, y = gcmr_transit_stations)) + geom_point(alpha = 0.1)
+```
+
+### North America
+
+```{r}
+ggplot(data = northData, aes(x = GovernmentResponseIndex, y = gcmr_transit_stations)) + geom_point(alpha = 0.1)
+```
+
+### South America
+
+```{r}
+ggplot(data = southData, aes(x = GovernmentResponseIndex, y = gcmr_transit_stations)) + geom_point(alpha = 0.1)
+```
+
+# Survival Analysis
+
+Survival analysis typically aims to identify the likelihood of entering a small number of states. The below example examines the transition from lowest retail activity in a country to its baseline, following a lockdown-induced crash.
+
+## Retail
+
+### Survival Objects
+
+```{r}
+minretail <- EAData %>% group_by(country) %>% slice_min(gcmr_retail_recreation) %>% distinct(date)
+names(minretail) <- c("country", "mindate")
+euna <- left_join(EAData, minretail)
+
+normalretail <- euna %>%
+  group_by(country) %>% 
+  filter(date > mindate, gcmr_retail_recreation > -8) %>% # the next date where retail greater than -8% (baseline variance)
+  slice_min(gcmr_retail_recreation) %>% 
+  slice_min(date) %>% 
+  distinct(date)
+names(normalretail) <- c("country", "maxdate")
+
+minmax<-left_join(minretail,normalretail)
+minmax$mindate <- ymd(minmax$mindate)
+minmax$maxdate <- ymd(minmax$maxdate)
+minmax <- minmax %>% mutate(
+  etime = ifelse(!is.na(maxdate),
+                 as.duration(mindate %--% maxdate) / ddays(1), 
+                 as.duration(mindate %--% ymd("2020-11-19") / ddays(1))),
+  event = ifelse(!is.na(maxdate),
+                 1,
+                 0)
+  )
+
+minmax <- left_join(minmax, select(euna, country, continent), by = "country")
+surv <- minmax %>% distinct(etime, event, continent) %>% slice_min(etime)
+
+surv$continent <- case_when(
+  surv$continent == "Europe" ~ "EU",
+  surv$continent == "North America" ~ "NA",
+  surv$continent == "South America" ~ "SA"
+)
+```
+
+### Cumulative incidence of hazard of attaining baseline of retail
+
+With the survival object ready, the cumulative incidence of re-attaining baseline for countries can be visualised.
+
+```{r}
+cumincfit <- cuminc(
+  ftime = surv$etime,
+  fstatus = surv$event,
+  group = surv$continent
+)
+
+plot(cumincfit, 
+     col = c(1,2,4),
+     lty = c(1,1,1),
+     lwd = 2,
+     wh = c(0,3),
+     xlab = "Days since lowest retail activity",
+     ylab = "Probability of returning to baseline activity", 
+     main = "Cumulative incidence of retail activity return\n to baseline by continent (n: EU = 34, NA = 16, SA = 10)")
+legend(-3, 1, c("Europe", "North America", "South America"),
+       col = c(1,2,4),
+       lwd = 2,
+       box.lty = 0,
+       bty = 'y')
+```
+
+The above cumulative incidence plot of the return to baseline retail activity highlights that European countries were quicker to return to baseline activity than North America. No countries in South America have yet returned to baseline retail activity. South American businesses may be seeing long-term depression in activity, while European business activity returned to baseline in 80% of countries within 100 days.
+
+Cannot be assumed hazard of EU vs NA represents a proportional hazard to the risk of returning to baseline activity.
+
+### Checking proportional hazards assumption in retail/recreation
+
+Proportional hazards on a log(-log) plot should be parallel. 
+
+```{r}
+surv_euna <- surv %>% filter(continent != "SA")
+retailfit_euna <- survfit(Surv(etime, event) ~ continent, surv_euna)
+plot(retailfit_euna, 
+     col = c(1,2), 
+     lwd = 2,
+     fun = "cloglog",
+     xlab = "log(days since lowest retail)",
+     ylab = "log(-log(Probability not reached baseline))",
+     main = "log(-log(Probability not reached baseline)) \nmethod using Kaplan-Meier estimator")
+legend("topleft", lty = c(1,1), lwd = c(2,2), col = c("black", "red"), c("Europe", "North America"))
+
+```
+
+### Modelling non-proportional hazards
+
+Proportional hazards assumption not met. Therefore must consider Accelerated Failure Time (AFT) models such as generalised gamma and Weibull.
+
+```{r}
+gg <- flexsurvreg(Surv(surv_euna$etime, surv_euna$event) ~ continent, data = surv_euna, dist="gengamma")
+wb <- flexsurvreg(Surv(surv_euna$etime, surv_euna$event) ~ continent, data = surv_euna, dist="weibull")
+
+plot(retailfit_euna, 
+     cumhaz = TRUE,
+     lty = c(1,2),
+     lwd = 2,
+     xlab = "Days since lowest retail activity",
+     ylab = "Cumulative hazard",
+     main = "Cumulative hazard of retail activity return\n to baseline by continent (n: EU = 34, NA = 16)")
+lines(gg, 
+      col = rgb(1,0,0,0.7), ci = FALSE,
+      type = "cumhaz")
+lines(wb, 
+      col=rgb(0,0,1,0.7),
+      type = "cumhaz",
+      ci=FALSE)
+legend("topleft", lty=c(1,1,1,2), lwd=c(2,2), col = c("blue","red","black","black"), c("Weibull","Generalized gamma", "Europe", "North America"))
+```
+
+By inspection these fit well on the cumulative hazard plot, for the hazard of returning to baseline retail activity.
+
+## Grocery and pharmacy
+
+```{r}
+mingroc <- euna %>% group_by(country) %>% slice_min(gcmr_grocery_pharmacy) %>% distinct(date)
+names(mingroc) <- c("country", "mindate")
+euna_g <- left_join(euna, mingroc)
+
+normalgroc <- euna_g %>%
+  group_by(country) %>% 
+  filter(date > mindate, gcmr_grocery_pharmacy > -8) %>% 
+  slice_min(gcmr_grocery_pharmacy) %>% 
+  slice_min(date) %>% 
+  distinct(date)
+names(normalgroc) <- c("country", "maxdate")
+
+minmax_g<-left_join(mingroc,normalgroc)
+minmax_g$mindate <- ymd(minmax_g$mindate)
+minmax_g$maxdate <- ymd(minmax_g$maxdate)
+minmax_g <- minmax_g %>% mutate(
+  etime = ifelse(!is.na(maxdate),
+                 as.duration(mindate %--% maxdate) / ddays(1), 
+                 as.duration(mindate %--% ymd("2020-11-19") / ddays(1))),
+  event = ifelse(!is.na(maxdate),
+                 1,
+                 0)
+  )
+
+minmax_g <- left_join(minmax_g, select(euna, country, continent), by = "country")
+surv_g <- minmax_g %>% distinct(etime, event, continent) %>% slice_min(etime)
+
+surv_g$continent <- case_when(
+  surv_g$continent == "Europe" ~ "EU",
+  surv_g$continent == "North America" ~ "NA",
+  surv_g$continent == "South America" ~ "SA"
+)
+
+cuminc_gfit <- cuminc(
+  ftime = surv_g$etime,
+  fstatus = surv_g$event,
+  group = surv_g$continent
+)
+
+plot(cuminc_gfit, 
+     col = c(1,2,4),
+     lty = c(1,1,1),
+     lwd = 2,
+     wh = c(0,3),
+     xlab = "Days since lowest grocery/pharmacy activity",
+     ylab = "Probability of returning to baseline activity", 
+     main = "Cumulative incidence of grocery/pharmacy activity return\n to baseline by continent (n: EU = 34, NA = 15, SA = 10)")
+legend(135,0.25, c("Europe", "North America", "South America"),
+       col = c(1,2,4),
+       lwd = 2,
+       box.lty = 0,
+       bty = 'y')
+```
+
+### Testing proportional hazards assumption
+
+```{r}
+surv_gfit <- survfit(Surv(etime, event) ~ continent, surv_g)
+plot(surv_gfit, 
+     col = c(1,2,4), 
+     lwd = 2,
+     fun = "cloglog",
+     xlab = "log(days since lowest grocery/pharmacy)",
+     ylab = "log(-log(Probability not reached baseline))",
+     main = "log(-log(Probability not reached baseline))\nmethod using Kaplan-Meier estimator")
+legend("topleft", lty = c(1,1,1), lwd = c(2,2,2), col = c("black", "red","blue"), c("Europe", "North America", "South America"))
+```
+
+Can be assumed proportional hazards. If treating the baseline continent as South America, then the below Cox Proportional Hazards table is below:
+
+```{r}
+surv_g$continent <- relevel(as.factor(surv_g$continent), "SA")
+coxph(Surv(surv_g$etime, surv_g$event) ~ surv_g$continent)
+```
+
+Yielding the hazard ratio of 2.32 (p = 0.02) for Europe attaining baseline grocery/pharmacy activity. In "businessy" terms, the probability of countries returning to baseline grocery/pharmacy activity at any time is 2.32 times higher in Europe than that of South America. 

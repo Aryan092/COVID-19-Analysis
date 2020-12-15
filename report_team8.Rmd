@@ -1,0 +1,368 @@
+---
+title: | 
+  | \vspace{-1.2cm} A Longitudinal and Cross-Sectional Analysis of Industry-Level 
+  | Effects of Government Interventions Against the Spread of COVID-19 \vspace{-.5cm}
+author: | 
+  | \vspace{-2cm} ST344 Team 8
+output: pdf_document
+# fig_width: 9 
+# fig_height: 0.2 
+geometry: margin=2cm
+fontsize: 11pt
+---
+
+\vspace{-2cm}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE,
+	root.dir = "..",
+	fig.width = 6,
+	fig.height = 3,
+	fig.align = 'center'
+)
+library(finalfit)
+library(knitr)
+library(rio)
+library(dplyr)
+library(readxl)
+library(stringr)
+library(ggplot2)
+library(gridExtra)
+library(zoo)
+library(lubridate)
+library(runner)
+library(flexsurv)
+library(survival)
+library(survminer)
+library(cmprsk)
+library(remotes)
+library(tidycovid19)
+library(ggrepel)
+library(grid)
+library(RColorBrewer)
+library(tidyverse)
+
+```
+```{r}
+library(ggplot2)
+```
+```{r}
+EAData <- import("./data/processed/EuropeAmericaData_unique_dates.csv", setclass = "tibble")
+
+EAData$DaysSinceJan1 <- as.numeric(as.Date(EAData$date) - as.Date("01-01-2020","%d-%m-%Y"))
+
+firstdiff <- function(x) {
+  shifted <- c(0,x[1:(length(x)-1)])
+  result = x-shifted
+  which_negative = which(result<0)
+  result[which_negative] = NA
+  return(result)
+}
+
+EAData <- EAData %>%
+  mutate(daily_confirmed = firstdiff(confirmed)) %>%
+filter(!is.na(continent)) %>%
+  filter(!is.na(C6_Stay.at.home.requirements)) %>%
+  filter(!is.na(H4_Emergency.investment.in.healthcare)) %>%
+  # group_by(country) 
+  # mutate(daily_confirmed = na.locf(daily_confirmed, na.rm = F)) %>%
+  # ungroup() %>%
+  mutate(daily_confirmed = if_else(is.na(daily_confirmed), 0, daily_confirmed))
+```
+
+
+```{r}
+EAData$week <- week(EAData$date)
+EAData <- EAData %>% group_by(country) %>% mutate(m_retail = rollmean(gcmr_retail_recreation, k = 7, fill = NA), m_workplaces = rollmean(gcmr_workplaces, k=7, fill = NA), m_groc = rollmean(gcmr_grocery_pharmacy, k=7, fill = NA), m_parks = rollmean(gcmr_parks, k=7, fill = NA)) %>% ungroup()
+
+
+EAData <- EAData %>%
+  group_by(country) %>%
+  mutate(
+    date = ymd(date),
+    active = sum_run(
+      x = daily_confirmed,
+      k = 14,
+      lag = 2
+    )) %>%
+      mutate(
+        active_per_pop = active/population
+      ) %>%
+  ungroup()
+```
+
+# Overview
+
+The ongoing outbreak of the novel SARS-CoV-2 is undoubtedly a great threat to public health. After gaining pandemic status (1), the rapid spread of the respiratory disease (Figure 1) associated with the virus, denominated COVID-19, exerted tremendous pressure on global health systems and economies. With workers worldwide shielding, self-isolating or hospitalised, the direct effects on business operations cannot be overstated.
+
+According to epidemiological research, there are two identifiable waves of the pandemic (2). Initially, national governments responded differently to the outbreak; while some enacted strict lockdowns, others opted for a more awareness- and recommendation-based approach. The offset of the second wave was marked by broad international consensus on containment measures and a global need for economic recovery.
+
+Considering the unforeseen challenges posed by the pandemic, as well as vastly different national policies and regulations, private enterprises have acknowledged the need to adapt and re-invent their operations in order to survive. At OmniCorp, actionable insight is paramount to the company philosophy; continuously, products and services must be tailored to consumers’ habits and preferences, while operations must act to recognise and support employees.
+
+```{r}
+library(tidycovid19)
+merged <- download_merged_data(cached = TRUE, silent = TRUE)
+# plot_covid19_spread(merged, highlight = c("ITA", "ESP", "GBR", "FRA", "DEU", "USA", "BRA", "MEX"),
+# intervention = "lockdown", edate_cutoff = 270)
+```
+
+```{r, fig.width=6}
+plot_covid19_spread(merged,type = "confirmed", highlight = c("ITA", "GBR", "DEU", "USA", "BRA", "MEX"), intervention = "lockdown", edate_cutoff = 270) + ylab("Reported confirmed cases\n(logarithmic scale)") + labs(caption = "Figure 1")
+```
+
+```{r world map, fig.align='center'}
+# map_covid19(merged, type = "confirmed", per_capita = TRUE) + labs(title = "New cases per day as of 1st December 2020",caption = "Figure 1")
+```
+
+# Scope
+
+This report aims to uncover the effects of governmental COVID-19 responses on consumer habits in a retrospective view, with a focus on changes in the general population’s retail preferences, travelling patterns and work environment activity. We restrict our attention to OmniCorp’s current operational locations: Europe, North and South America. We will describe long-term trends, then use financial quarters as framework for reporting notable conclusions. Key factors contributing to changes in consumer habits will be identified, and contextualised for managerial decision-making.
+
+Two clearly identifiable long-term trends in mobility habits emerged, prompting continent-specific analyses. While American countries display a gradual return to normality after the sudden decline, European countries tend to have a more fluctuating journey. Additionally, each continent displays a significant variation in their constituent countries’ stringency of containment and health policies. These policies directly impact consumer mobility and national active cases. To address the duality between consumer mobility and cases, two deterministic models of varying complexities will be developed. The simpler of which includes the degree of containment policies and the proportion of active cases in the population, while the other additionally accounts for health policies and interactions between policy indicators (Appendix 3). The final choices are outlined in the sections below.
+
+Despite taking a holistic approach and sourcing our data from highly reliable providers, we recognise that, given the novelty and rapid spread of the disease, it has been difficult for national statistical agencies to collect, record and report data in real time. Similarly, it has been difficult for business solutions companies to design frameworks of interpretation and analysis. These, as well as other limitations of the present project, are highlighted alongside possible extensions of the analysis at the end of the report.
+
+# The Retail Sector
+
+For the purposes of this report, and in line with the chosen datasets, we distinguish between two types of shopping in which the general population engages: *functional* and *recreational*. The former encompasses grocery shopping and visits to pharmacies, while the latter encompasses all other forms of retail and recreation (besides wholesale). We explore the changes in retail activity and design a statistical model which, if trained, would prove useful in subsequent predictive analysis.
+
+## Retail and Recreation
+```{r, fig.height=3}
+# ggCorpIden()
+retailrecreport<- ggplot(aes(x=date, y=m_retail), data = EAData) + geom_line(aes(group = country), alpha = 0.1) + facet_wrap(~ continent) + geom_point(alpha = 0) + geom_smooth(method = "gam")+labs(x = "Date", y = "Change in Retail & Recreation Activity (%)", caption="Figure 2")+ggtitle("Fall and recovery in retail and recreation activity in 2020") + theme_minimal()
+print(retailrecreport)
+```
+
+Figure 2 illustrates both similarities and differences in the behavioural patterns of the general population, both of which guide our statistical analysis. Particularly interesting is the visual similarity of pattern shape during Q1 and Q2 across all continents. Between February and April, a steep downward-sloping trend characterises the change in recreational retail activity, with an estimated global minimum of -63 percentage points in European and North American countries, and of -80 percentage points in South American countries. During the following quarter, this dramatic decrease is followed by a swift recovery. The onset of Q3 marks an important distinction in terms of behavioural trends between the continents. European countries see a continuation of upward trend, reaching an estimated return to normality by the end of the quarter, while the population in American countries engaged in a more gradual increase in activity. Q4 further emphasises discrepancies in behavioural responses, with Europe displaying a decrease in retail activity whose best fit resembles a quadratic curve spanning Q3 and Q4, while improvements in American countries continue to occur gradually throughout the last two quarters, at what can be best visually described as a quasi-linear rate, with no inflection points.
+
+Countries with exceedingly high testing capacity have allowed employees to resume their presence at work after a shorter self-isolation period than all the other countries (Appendix 1.1.1 pp. 10).
+
+Moreover, the European retail sector has manifested a remarkable recovery, with 80% of countries resuming baseline business activity within 100 days of their minimum (Appendix 4.1.2)
+
+Compared to Q1 and Q2, social interaction was decidedly higher during the second half of the year. (Appendix 1.1.1 pp. 9)
+
+Interestingly, the best fit simple model for European countries excludes the dependency of the active cases tally (Appendix 3.1.1). Therefore, regardless of the trend in the disease spread, the general population's recreational retail habits only change according to government interventions.
+
+By visual inspection and statistical considerations, the complex models are a slightly better fit than the simple ones, generally offering a 10-15% increase in efficiency (Appendix 3.1.2). This is unsurprising, as a certain degree of variation in the behavioural responses of individuals and communities can only be explained by qualitative measures, such as cultural values and psychological well-being.
+
+### Key business takeaways:
+
++ A slightly higher degree of stay at home requirements causes a more pronounced negative effect on European consumers (8% decrease) than on North and South American consumers (6 and, respectively, 2% decrease) (Appendix 3.1.8). This may be explained by the wider variety of entertainment options and higher availability of online retail services.
+
++ A one-level increase of international travel restrictions leads to a slight increase of recreational retail activities in Europe and North America, while South America might record a 6.5% decrease. 
+
++ A slight increase of the active case tally as a percentage of the population has widely different effects by continent- European countries seem to record a decline in retail activity and South American countries show increased activity levels. By comparison, North American consumer response seems to be largely unaffected by changes in the spread of the pandemic (Appendix 3.1.3).
+
+## Grocery and Pharmacy
+
+```{r }
+# ggCorpIden()
+pharmreport<- ggplot(aes(x=date, y=m_groc), data = EAData) + geom_line(aes(group = country), alpha = 0.1) + facet_wrap(~ continent) + geom_point(alpha = 0) + geom_smooth(method = "gam")+ labs(x ="Date", y="Rolling average of change in \ngrocery & pharmacy activity (%)", caption="Figure 3")+ggtitle("Fall and recovery of grocery & pharmacy activity in 2020") + theme_minimal()
+print(pharmreport)
+```
+
+Similar behaviour of the overall trends can be observed in terms of functional shopping. Figure 3 shows that initial activity decrease is substantially lower, compared to recreational retail facilities. 
+
+During Q2, European countries display a rapid surge in activity, while American countries' recovery was slower and steadier in the second half of Q2. However, during the last two quarters, activity in Europe remains around the baseline level, which might denote European companies' and governments' ability to adapt to changing circumstances. By comparison, American countries did not manage a return to baseline level, ending Q3 at a 15% average decline from baseline, and achieving an average of 35% recovery by the mid-point of Q4. The only American country to achieve a positive functional shopping activity level during Q3 and Q4 is Brazil.
+
+There is an increase from baseline across all continents in the frequency and length of visits to both types of locations, and while it is proportional in Europe, the Americas witnessed a larger increase in functional shopping mobility than in the recreational sector.
+
+### Key business takeaways:
+
++ Despite varying levels of lockdown, European consumers' preferences did not change significantly; decreases in consumption and activity can be largely explained by the impact of national restrictions.
+
++ A similar analysis to that of the probability of reaching baseline activity levels of recreation and retail has concluded that the probability of European countries achieving baseline functional shopping activity levels at any time is 2.32 times higher than in South American countries (Appendix 4.2).
+
++ The retail paradigm has shifted towards digitalisation, with businesses relocating to the online medium, where delivery services are readily available. There were several successful initiatives of incorporating grocery stores and pharmacies into online delivery services during Q3 and Q4 (3), which may explain Europe's tendency to remain at baseline levels, while American countries struggled with a gradual recovery.
+
+## The Hospitality Sector
+
+Answering the question of effects on the hospitality sector is less straightforward than that aimed at the retail sector. In line with OmniCorp's business interests, we will analyse this sector within the framework of the definition outlined in the United States Department of Labor SIC (4), limited by our datasets to the food service industry and passenger transportation. We explore the changes in transit stations activity, taking into consideration international and internal travel restrictions. By incorporating the social distancing measures and changes in the activity occurring in parks, we aim to derive conclusions about the population's willingness to travel for leisure.
+
+The hospitality industry has suffered major losses in all sectors. Mass transportation, as well as food industry venues (restaurants and cafes), have operated at reduced capacity, in order to adhere to social distancing measures implemented for virus containment purposes.
+
+```{r}
+# ggCorpIden()
+transitreport<-ggplot(aes(x = date, y = gcmr_transit_stations, color = StringencyIndex, group=country ),data = EAData) +
+    geom_point(alpha = 0.5, size = 0.3) + geom_smooth(colour = "red", method = "loess", group = 1)+labs(x="Date", y="Change in Transit Station Activity (%)", caption = "Figure 4") +ggtitle("Fall and recovery of transit station activity in 2020") + facet_wrap(~continent) + theme_minimal()
+print(transitreport)
+```
+
+```{r}
+
+# ggCorpIden()
+# parksreport<- ggplot(aes(x=date, y=m_parks), data = EAData) + geom_line(aes(group = country), alpha = 0.1) + facet_wrap(~ continent) + geom_point(alpha = 0) + geom_smooth(method = "gam")+xlab("Date")+ylab("Change in Park Activity (%)")+ggtitle("Park activity significantly dropped over the year") 
+# print(parksreport)
+```
+
+The general pattern applies to transit station activity, as well. The initial decrease was significantly higher in America than in Europe, with an average minimum level of -50 and -65, respectively.
+
+The passenger transportation industry has suffered greatly during Q1 and Q2, with transit station activity reaching an all-time low at the mid-point of Q2. Europe’s tendency to lift strict restrictions coincided with an increase in transit activity. Considering that throughout Q2 common transportation capacity was generally reduced by 50% by law, we can understand that travellers’ habits might not have changed drastically, and their confidence improved as. However, Q4 marked the beginning of a second decrease in transit activity, which can be partly explained by companies’ efforts of implementing teleworking practices, as well as the permanent closure of several small businesses due to financial fragility.
+
+As European countries generally relaxed their restrictions throughout Q3 and Q4, there is an obvious increase in transit activity which peaked at an average of -10% change from baseline level at the mid-point of Q3. American countries approached the situation differently. While a select few relaxed their measures from July onwards, most of them extended the strict measures, which included reduced common transportation capacity. Despite strict national mandates, all American countries manifested increased transit activity, which peaked in Q4 at an average of -25%. 
+
+```{r}
+df = EAData
+ctries <- df %>%
+  group_by(iso3c) %>%
+  filter(!is.na(deaths), population >= 10e6) %>%
+  filter(date == max(date)) %>%
+  summarise(deaths_per_mio_pop = deaths * 1e6/population) %>%
+  filter(deaths_per_mio_pop > 100) %>% 
+  pull(iso3c)
+ave_measures <- df %>%
+  arrange(iso3c, date) %>%
+  group_by(iso3c) %>%
+  filter(iso3c %in% ctries) %>%
+  mutate(
+    new_cases = confirmed - lag(confirmed),
+    total_tests = na.approx(total_tests, na.rm = FALSE),
+    new_tests = total_tests - lag(total_tests),
+    ave_pos_test_rate = rollsum(
+      (confirmed - lag(confirmed))/new_tests,
+      7, na.pad=TRUE, align="right"
+    ),
+    ave_new_cases_wk_per_100e5 = rollsum(
+      new_cases*1e5/population, 7, na.pad=TRUE, align="right"
+    ),
+    ave_soc_dist_google = rollmean(
+      (gcmr_retail_recreation +  gcmr_transit_stations +
+        gcmr_workplaces)/3, 7, na.pad=TRUE, align="right"
+    ),
+    ave_soc_dist_apple = rollmean(
+      (apple_mtr_driving + apple_mtr_walking + apple_mtr_transit)/3, 7, na.pad=TRUE, align="right"
+    )
+  ) %>%
+  filter(
+    max(
+      (date < lubridate::ymd("2020-04-01")) *  ave_new_cases_wk_per_100e5,
+      na.rm = TRUE
+    ) > 10
+  ) %>%
+  select(
+    iso3c, country, date, population, ave_new_cases_wk_per_100e5, 
+    ave_pos_test_rate, ave_soc_dist_apple, ave_soc_dist_google, new_tests
+  ) 
+smp_countries <- unique(ave_measures$country)
+my_palette <- c(brewer.pal(8, "Set1"), "lightblue")
+ave_measures %>%
+  filter(date < lubridate::ymd("2020-06-01")) %>%
+  summarise(
+    cases = max(ave_pos_test_rate, na.rm = TRUE),
+    tests = mean(new_tests*1e5/population, na.rm = TRUE),
+    soc_dist = -min(ave_soc_dist_google, na.rm = TRUE)/100,
+    .groups = "drop"
+  ) %>% mutate(wave = "Spring") %>%
+  select(iso3c, wave, cases, soc_dist, tests) -> spring_wave
+ave_measures %>%
+  filter(date > lubridate::ymd("2020-09-01")) %>%
+  summarise(
+    cases = max(ave_pos_test_rate, na.rm = TRUE),
+    tests = mean(new_tests*1e5/population, na.rm = TRUE),
+    soc_dist = -min(ave_soc_dist_google, na.rm = TRUE)/100,
+    .groups = "drop"
+  ) %>% mutate(wave = "Autumn") %>%
+  select(iso3c, wave, cases, soc_dist, tests) -> fall_wave
+soc_dist_by_wave <- rbind(spring_wave, fall_wave)
+soc_dist_by_wave$wave <- factor(soc_dist_by_wave$wave, c("Spring", "Autumn"))
+```
+
+```{r }
+# ggCorpIden()
+ggplot(soc_dist_by_wave, aes(
+  x = cases, y = soc_dist, color = wave, label = iso3c)) +
+  geom_point() + 
+  geom_text_repel(color = "black") +
+  scale_x_continuous(trans = "log10") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  theme_minimal() +
+  scale_color_manual(values = my_palette) +
+  labs(
+    x = "Confirmed Cases per New Tests\n(log scale)",
+    y = "Reduction in Social Interaction\n(percentage to baseline)", title = "Comparing the decrease in social interaction \n in the Autumn and Spring waves", caption="Figure 5: Social interaction data: Google Community Mobility Reports data \nrelative to the baseline period of Jan 3 to Feb 6, 2020\nInterventions data: ACAPS. Date obtained: November 19, 2020")
+ # theme(plot.title = element_text(hjust = -0.1, vjust=2.12))
+```
+
+### Key business takeaways:
+
++ Movement restrictions, coupled with consumers' desire to travel, have resulted in consistent increased activity in parks and open-air facilities. While there are several business sectors which manifest increasing online presence, people have not ceased to seek human interaction and travel opportunities, despite governments' efforts to minimise in-person contact. Moreover, constrained by movement restrictions, people were forced to abandon the idea of popular travel destinations and explore local attractions.
+
++ As movement restrictions were enacted and hospitality venues were temporarily closed due to being deemed non-essential by governments, a vacationing style under the portmanteau term of "staycation" (stay-at-home vacation) regained popularity, possibly changing the common understanding of travelling.
+
++ Increasingly strict governmental health measures have imposed a new standard for passenger and facility sanitation standards, which might be mandatory for hospitality venue operators even in the post-pandemic world.
+
++ Governmental contact tracing programs have fostered robust data collection and faster processing practices, while simultaneously raising questions about the general availability of user location data. These consequences of health policies have led to a more interconnected and transparent world.
+
+# The Labour Sector
+
+Another dimension we explore is the possible impact of the pandemic and governmental restrictions on the members of staff. During national lockdown periods, businesses and governments have made joint efforts to provide financial aid to individuals who were unable to work. Our insight is based on the indirect impact of the pandemic on workers; we analyse the change in workplace activity.
+
+```{r }
+# ggCorpIden()
+workplacesreport<- ggplot(aes(x=date, y=m_workplaces), data = EAData) + geom_line(aes(group = country), alpha = 0.1) + facet_wrap(~ continent) + geom_point(alpha = 0) + geom_smooth(method = "gam")+labs(x="Date", y="Change in Workplace Activity (%)",caption = "Figure 6")+ggtitle("Fall and recovery of workplace activity in 2020") + theme_minimal() 
+print(workplacesreport)
+```
+
+Similarly, to earlier analyses, the preliminary visualisation of the workplace activity change time series unveils two distinct courses of action. As displayed in Figure 6, the global trend of stark reduction in workplace activity changes at the onset of Q2 to a sharp increase, which stabilised to a short-term stagnation. In Q3, Europe recorded a slight decrease, followed by an improvement, while North American countries display some degree of stagnation, and South American countries, a slight increase. The trends identified in America were consistent during Q4, while Europe follows an alternative pattern of decreases and increases, whose variance seems to reduce over time. 
+
+### Key business takeaways:
+
++ Although mobility data indicates that workplace locations have recorded lower activity, both the public and the private sector have mostly resumed their activity in Q3 and made significant progress towards more democratic service delivery.
+
++ International travel restrictions and social distancing mandates have forced businesses to implement online collaboration and teleworking.
+
++ A slightly higher degree of stay at home requirements causes a more pronounced negative effect on European consumers (8% decrease) than on North and South American consumers (6 and, respectively, 2% decrease) (Appendix 3.1.8). This can be explained by the wider variety of entertainment options and higher availability of online retail services.
+
++ A one-level increase of international travel restrictions leads to a slight increase of recreational retail activities in Europe and North America, while South America records a 6.5% decrease (Appendix 3.1.8).
+
++ A slight increase of the active case tally as a percentage of the population has widely different effects by continent- European countries seem to record a decline in retail activity and South American countries show increased activity levels. By comparison, North American consumer response seems to be largely unaffected by changes in the spread of the pandemic (Appendix 3.2.6).
+
++ Surging active case numbers in countries (Appendix 1.1.1 pp. 11) has been shown to have an negative effect on retail and workplace activity, particularly in Europe and South America (Appendix 3.1.8; 3.2.6). Active case numbers are directly representative of the numbers of employees unable to work, through self-isolation or hospitalisation. As the majority of the labour force cannot practice teleworking, business activity disruptions may easily arise in countries with high active cases.
+
+# Extensions & Limitations
+
+Given more time, we would have trained our models on several subsets of the analysed data in order to accurately assess and improve their predictive power. However, a lack of training data for the models reduces the likelihood that their predictive power is high. We would have also explored the impact of weather and climate on the short-term and long-term behavioural responses of the population. 
+
+We would have also created a reliable model for the confirmed case tally, and assessed its performance on a country-by-country basis. This could prove useful for descriptive, as well as predictive purposes. Company executives should be able to understand the current level of public health concerns, in order to anticipate future lockdowns and business closure requirements, which have to be considered in the process of business planning.
+
+Business-specific data was limited; our inferences on the business industry are primarily derived from models of the general populations’ behavioural changes, based on government interventions and country-specific macroeconomic indicators. For example, there seems to be a lack of anonymised data on hospitality venues (occupancy rates, fluctuations in prices) from reliable sources. In addition, there was no measure for international arrivals in each country. The availability of both previously mentioned types of data would help us better understand the impact of lockdowns in tourism-oriented countries.
+
+With a more comprehensive demographical breakdown of the disease measurements (i.e. confirmed cases, deaths, recovered), we could have assessed the impact of lockdown measures by settlement type (rural and urban). This analysis could further be extended by an analysis of the production sector, which might help identify trends in wholesale activity.
+
+A measure for the change in agricultural output or work activity of agricultural employees could have shaped the assessment of changes in the food production industry. Of particular interest would have been the “panic buying” stage, when several countries recorded supply shortage in supermarket chains. Several countries lack national testing capacity data, which could have helped us assess the impact of widely adopted containment and health policies such as social distancing and mask-wearing. If data on private transport was widely available for all countries, it would be possible to identify long-term trends in customer travel arrangement and journey time preferences.
+
+Traffic data would be useful for the assessment of air travel patterns and holiday planning habits, which can illustrate the effects of movement restrictions on the hospitality sector more accurately than transit station activity.
+
+In the absence of data on business bailouts, we were not able to assess the impact of governmental financial aid programs designed to mitigate the losses caused by containment measures.
+
+The presence of data on the population’s well-being could lead to a very informative analysis on the mental health impacts of government interventions, which could guide company-level policies which foster employees’ well-being.
+
+\newpage
+
+# Bibliography
+
+1.	WHO Director-General (March 2020), *Media briefing on COVID-19*. World Health Organization.
+
+2.	Xu, Shunqing; Li, Yuanyuan (2020), *Beware of the second wave of COVID-19*. The Lancet Vol 395 Issue 10233, p1321-1322.
+
+3.	Louise Whitbread (19 May 2020), *Which supermarkets let you order your groceries through Deliveroo?*. The Independent https://www.independent.co.uk/extras/indybest/food-drink/deliveroosupermarket-delivery-grocery-morrisons-coop-a9457006.html Accessed: <30/11/2020>.
+
+4.	Georgetown University Library (2020), *Global Hospitality Leadership: Industry & Company Information*. https://guides.library.georgetown.edu/c.php?g=76036&p=487475 Accessed: <30/11/2020>.
+
+5.  Beckley, Ross; Weatherspoon, Cametria; Alexander, Michael; Chandler, Marissa; Johnson, Anthony; Batt, Ghan S. (2013) *Modeling epidemics with differential equations*. Tennessee State University Internal Report.
+
+6.  Baker, RE, Yang, W, Vecchi, GA, Metcalf, CJE, Grenfell, BT. (2020), *Susceptible supply limits the role of climate in the early SARS-CoV-2 pandemic*. Science. doi: 10.1126/science.abc2535.
+
+7.	Google LLC (2020), *Google COVID-19 Community Mobility Reports*. https://www.google.com/covid19/mobility/ Accessed: <30/11/2020>.
+
+8.	Hale, Th., Webster, S., Pethernick, A., Phillips, T., Kira, B. (2020), *Oxford COVID-19 government Response Tracker*. Blavatnik School of government. https://github.com/OxCGRT/covidpolicy-tracker/ Accessed: <30/11/2020>.
+
+9.	Gassen, J. (2020), *Download, Tidy and Visualize Covid-19 Related Data* https://joachim-gassen.github.io/tidycovid19/index.html.
+
+10. ICAO (2020), *Guidance for Air Travel through the COVID-19 Public Health Crisis* https://www.icao.int/covid/cart/Pages/CART-Take-off.aspx.
+
+
+
